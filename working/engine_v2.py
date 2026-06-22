@@ -1,15 +1,11 @@
 import torch
 import torch.nn as nn
-from .predictor import LowRankPredictor
-from .quantizer import pack_2bit, unpack_2bit_vectorized
+from pas_offload.predictor import LowRankPredictor
+from .quantizer_v2 import pack_2bit, unpack_2bit_vectorized_v2
 
-class PASOffloadEngine:
+class PASOffloadEngineV2:
     """
-    PAS-Offload Coordination Engine (Optimized).
-    Handles host-side transposed weight caching, CPU-side active-column prediction,
-    pinned memory DMA transfer, and on-GPU weight unpacking and execution.
-    
-    Includes the following optimizations:
+    Optimized PAS-Offload coordination engine supporting:
     1. Pre-allocated page-locked (pinned) CPU host buffers for zero-copy DMA.
     2. Double-buffering pipelining to overlap compute with transfer.
     3. Pre-allocated GPU buffers to eliminate dynamic memory allocations.
@@ -108,8 +104,7 @@ class PASOffloadEngine:
         Compresses and loads weight matrix of shape (out_features, in_features)
         into the transposed CPU host cache.
         """
-        assert weights_f16.shape == (self.out_features, self.in_features), \
-            f"Weight shape mismatch. Expected {(self.out_features, self.in_features)}, got {weights_f16.shape}"
+        assert weights_f16.shape == (self.out_features, self.in_features)
         
         packed_temp = torch.zeros(self.out_features, self.bytes_per_col, dtype=torch.uint8)
         scales_temp = torch.zeros(self.out_features, dtype=torch.float16)
@@ -131,16 +126,9 @@ class PASOffloadEngine:
         Asynchronously schedules active column prediction, CPU slicing, 
         PCIe DMA weight streaming, and GPU dequantization on a dedicated stream.
         
-        Args:
-            x (torch.Tensor): Input hidden state vector, shape (1, in_features).
-            threshold (float): Prediction activation threshold.
-            buffer_idx (int): Buffer slot index (0 or 1) to use.
-            
         Returns:
             ticket (dict): Metadata about the scheduled job.
         """
-        assert x.shape == (1, self.in_features), f"Input shape mismatch. Expected {(1, self.in_features)}, got {x.shape}"
-        
         # 1. Run CPU Predictor
         x_cpu = x[0]
         indices = self.predictor.predict_indices(x_cpu, threshold)
@@ -177,7 +165,7 @@ class PASOffloadEngine:
                 )
                 
                 # Unpack 2-bit weights directly into the pre-allocated GPU output buffer
-                unpack_2bit_vectorized(
+                unpack_2bit_vectorized_v2(
                     self.sliced_packed_gpu[buffer_idx][:active_cols],
                     self.scales_gpu[buffer_idx][:active_cols],
                     self.min_vals_gpu[buffer_idx][:active_cols],
@@ -187,7 +175,7 @@ class PASOffloadEngine:
                 )
         else:
             # Fallback dequantization on CPU
-            unpack_2bit_vectorized(
+            unpack_2bit_vectorized_v2(
                 self.sliced_packed_gpu[buffer_idx][:active_cols],
                 self.scales_gpu[buffer_idx][:active_cols],
                 self.min_vals_gpu[buffer_idx][:active_cols],

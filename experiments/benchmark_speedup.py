@@ -1,116 +1,122 @@
 import os
+import sys
 import time
 import torch
 import torch.nn as nn
 import numpy as np
-import sys
 import matplotlib.pyplot as plt
 
+# Add root folder to python path to import pas_offload
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from pas_offload.engine import PASOffloadEngine
+
 def run_speedup_experiment():
-    print("==================================================")
-    print("EXPERIMENT: Speedup Verification (Standard CPU vs PAS-Offload)")
-    print("==================================================")
+    print("======================================================================")
+    print("EXPERIMENT: Speedup Verification (CPU vs Sequential vs Pipelined)")
+    print("======================================================================")
     
     in_features = 4096
     out_features = 11008
+    iters = 100
     
-    # Hidden state shape: (1, 4096)
-    x_cpu = torch.randn(1, in_features, dtype=torch.float16)
-    x_gpu = x_cpu.cuda()
+    # Initialize CPU-side input tensors
+    xs_cpu = [torch.randn(1, in_features, dtype=torch.float16) for _ in range(iters)]
+    xs_gpu = [x.cuda() for x in xs_cpu]
     
     print("Initializing weights...")
     W_cpu = torch.randn(out_features, in_features, dtype=torch.float16)
     W_gpu = W_cpu.cuda()
     
     # --------------------------------------------------
-    # 1. Simulate Standard Offload: CPU Computation
+    # 1. Standard CPU Execution (representing CPU Split)
     # --------------------------------------------------
-    print("\n--- Measuring Standard Offload: CPU Execution ---")
-    print("Running matrix multiplication on CPU (representing CPU-split layers)...")
+    print("\n--- 1. Measuring Standard CPU Execution ---")
     
     # Warmup
     for _ in range(5):
-        _ = torch.matmul(x_cpu, W_cpu.t())
+        _ = torch.matmul(xs_cpu[0], W_cpu.t())
         
-    iters = 50
     start = time.perf_counter()
-    for _ in range(iters):
-        _ = torch.matmul(x_cpu, W_cpu.t())
+    for i in range(iters):
+        _ = torch.matmul(xs_cpu[i], W_cpu.t())
     cpu_time_ms = (time.perf_counter() - start) / iters * 1000
     print(f"Standard CPU Execution Time: {cpu_time_ms:.3f} ms")
     
     # --------------------------------------------------
-    # 2. Measure PAS-Offload Execution Path
+    # 2. Baseline PAS-Offload (Sequential GPU)
     # --------------------------------------------------
-    print("\n--- Measuring PAS-Offload: Predictor + Sparse Transfer + GPU Execution ---")
+    print("\n--- 2. Measuring Baseline PAS-Offload (Sequential) ---")
+    engine = PASOffloadEngine(in_features, out_features, rank=16)
+    engine.load_weights(W_cpu)
     
-    # Initialize CPU Predictor
-    predictor = nn.Sequential(
-        nn.Linear(in_features, 16, bias=False),
-        nn.Linear(16, out_features, bias=True)
-    )
-    
-    # Transposed weight representation on CPU (for contiguous slicing)
-    W_transposed_cpu = torch.randn(out_features, in_features, dtype=torch.float16, pin_memory=True)
-    
-    # Generate active column index mask (10% sparsity)
-    indices = torch.randperm(out_features)[:int(out_features * 0.10)]
-    
-    # Warmup PAS-Offload path
+    # Warmup
     for _ in range(5):
-        # CPU Predictor (cast input to float32 to avoid dtype mismatch)
-        _ = torch.sigmoid(predictor(x_cpu.float()))
-        # CPU contiguous slice
-        sliced = torch.index_select(W_transposed_cpu, 0, indices)
-        # Asynchronous stream to GPU
-        sliced_gpu = sliced.cuda(non_blocking=True)
-        # GPU Execution
-        _ = torch.matmul(x_gpu, sliced_gpu.t())
+        _ = engine.forward(xs_gpu[0], threshold=0.15)
     torch.cuda.synchronize()
     
     start = time.perf_counter()
-    for _ in range(iters):
-        # Step 1: Predict active columns on CPU
-        _ = torch.sigmoid(predictor(x_cpu.float()))
-        
-        # Step 2: Contiguous memory slicing in CPU RAM
-        sliced = torch.index_select(W_transposed_cpu, 0, indices)
-        
-        # Step 3: Stream sliced weights to GPU
-        sliced_gpu = sliced.cuda(non_blocking=True)
-        
-        # Step 4: Execute matrix multiplication on GPU
-        _ = torch.matmul(x_gpu, sliced_gpu.t())
-        
+    for i in range(iters):
+        _, _ = engine.forward(xs_gpu[i], threshold=0.15)
     torch.cuda.synchronize()
-    pas_time_ms = (time.perf_counter() - start) / iters * 1000
-    print(f"PAS-Offload Execution Time: {pas_time_ms:.3f} ms")
+    v1_time_ms = (time.perf_counter() - start) / iters * 1000
+    print(f"Sequential PAS-Offload Time:    {v1_time_ms:.3f} ms")
+    
+    # --------------------------------------------------
+    # 3. Optimized PAS-Offload (Pipelined Double-Buffered)
+    # --------------------------------------------------
+    print("\n--- 3. Measuring Optimized PAS-Offload (Pipelined) ---")
+    
+    # Warmup pipelined path
+    ticket = engine.submit_forward(xs_gpu[0], threshold=0.15, buffer_idx=0)
+    for i in range(1, 5):
+        buf_idx = i % 2
+        next_ticket = engine.submit_forward(xs_gpu[i], threshold=0.15, buffer_idx=buf_idx)
+        _ = engine.execute_forward(xs_gpu[i-1], ticket)
+        ticket = next_ticket
+    _ = engine.execute_forward(xs_gpu[4], ticket)
+    torch.cuda.synchronize()
+    
+    start = time.perf_counter()
+    # Pipeline loop
+    # Submit first layer/token
+    ticket = engine.submit_forward(xs_gpu[0], threshold=0.15, buffer_idx=0)
+    for i in range(1, iters):
+        buf_idx = i % 2
+        # Asynchronously schedule prediction, slicing, and transfer of L + 1
+        next_ticket = engine.submit_forward(xs_gpu[i], threshold=0.15, buffer_idx=buf_idx)
+        
+        # Execute layer L
+        _ = engine.execute_forward(xs_gpu[i-1], ticket)
+        
+        ticket = next_ticket
+        
+    # Execute the final token/layer
+    _ = engine.execute_forward(xs_gpu[iters-1], ticket)
+    torch.cuda.synchronize()
+    v2_time_ms = (time.perf_counter() - start) / iters * 1000
+    print(f"Pipelined PAS-Offload Time: {v2_time_ms:.3f} ms")
     
     # --------------------------------------------------
     # Results Summary
     # --------------------------------------------------
-    print("\n--------------------------------------------------")
-    print("Speedup Results Summary")
-    print("--------------------------------------------------")
-    print(f"CPU Split Latency (per layer): {cpu_time_ms:.3f} ms")
-    print(f"PAS-Offload Latency (per layer): {pas_time_ms:.3f} ms")
-    print(f"Latency Saved:                  {cpu_time_ms - pas_time_ms:.3f} ms")
-    print(f"Speedup Factor:                 {cpu_time_ms / pas_time_ms:.2f}x")
+    print("\n" + "=" * 50)
+    print("Performance Comparison Results")
+    print("=" * 50)
+    print(f"Standard CPU Latency:         {cpu_time_ms:.3f} ms")
+    print(f"Sequential PAS-Offload Latency: {v1_time_ms:.3f} ms (V1 Speedup: {cpu_time_ms / v1_time_ms:.2f}x)")
+    print(f"Pipelined PAS-Offload Latency:  {v2_time_ms:.3f} ms (V2 Speedup: {cpu_time_ms / v2_time_ms:.2f}x)")
+    print("-" * 50)
+    print(f"Pipelined speedup over CPU:    {cpu_time_ms / v2_time_ms:.2f}x")
+    print("=" * 50)
     
-    # Translate to 32-layer LLM tokens/sec
-    cpu_tokens_sec = 1000.0 / (cpu_time_ms * 32)
-    pas_tokens_sec = 1000.0 / (pas_time_ms * 32)
-    print(f"Estimated FFN Throughput (CPU Split): {cpu_tokens_sec:.2f} tokens/s")
-    print(f"Estimated FFN Throughput (PAS-Offload): {pas_tokens_sec:.2f} tokens/s")
-
     # --------------------------------------------------
     # Save Comparison Plot
     # --------------------------------------------------
     print("\nGenerating speedup comparison plot...")
-    plt.figure(figsize=(8, 5))
-    categories = ['Standard CPU Split', 'PAS-Offload (Ours)']
-    times = [cpu_time_ms, pas_time_ms]
-    colors = ['#dc3545', '#28a745'] # crimson and green
+    plt.figure(figsize=(9, 5.5))
+    categories = ['Standard CPU Split', 'PAS-Offload (Sequential)', 'PAS-Offload (Pipelined)']
+    times = [cpu_time_ms, v1_time_ms, v2_time_ms]
+    colors = ['#dc3545', '#ffc107', '#28a745'] # red, amber, green
     
     bars = plt.bar(categories, times, color=colors, width=0.5, edgecolor='black', linewidth=1.2)
     
@@ -125,9 +131,9 @@ def run_speedup_experiment():
     plt.grid(True, linestyle="--", alpha=0.5, axis='y')
     
     # Add Speedup annotation
-    speedup = cpu_time_ms / pas_time_ms
-    plt.text(0.5, (cpu_time_ms + pas_time_ms)/2.0, f"{speedup:.1f}x Speedup", ha='center', va='center', 
-             bbox=dict(boxstyle="round,pad=0.3", fc="#e2f0d9", ec="#385723", lw=2), fontsize=12, fontweight='bold')
+    speedup = cpu_time_ms / v2_time_ms
+    plt.text(1.0, max(times) * 0.7, f"{speedup:.1f}x Total Speedup", ha='center', va='center', 
+             bbox=dict(boxstyle="round,pad=0.4", fc="#e2f0d9", ec="#385723", lw=2.5), fontsize=12, fontweight='bold')
     
     # Create images directory
     image_dir = "../images" if os.path.basename(os.getcwd()) == "experiments" else "images"
