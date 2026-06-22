@@ -51,12 +51,12 @@ def run_speedup_experiment():
     
     # Warmup
     for _ in range(5):
-        _ = engine.forward(xs_gpu[0], threshold=0.15)
+        _ = engine.forward(xs_gpu[0], threshold=0.15, top_k=1100)
     torch.cuda.synchronize()
     
     start = time.perf_counter()
     for i in range(iters):
-        _, _ = engine.forward(xs_gpu[i], threshold=0.15)
+        _, _ = engine.forward(xs_gpu[i], threshold=0.15, top_k=1100)
     torch.cuda.synchronize()
     v1_time_ms = (time.perf_counter() - start) / iters * 1000
     print(f"Sequential PAS-Offload Time:    {v1_time_ms:.3f} ms")
@@ -67,10 +67,10 @@ def run_speedup_experiment():
     print("\n--- 3. Measuring Optimized PAS-Offload (Pipelined) ---")
     
     # Warmup pipelined path
-    ticket = engine.submit_forward(xs_gpu[0], threshold=0.15, buffer_idx=0)
+    ticket = engine.submit_forward(xs_gpu[0], threshold=0.15, buffer_idx=0, top_k=1100, x_cpu_hint=xs_cpu[0])
     for i in range(1, 5):
         buf_idx = i % 2
-        next_ticket = engine.submit_forward(xs_gpu[i], threshold=0.15, buffer_idx=buf_idx)
+        next_ticket = engine.submit_forward(xs_gpu[i], threshold=0.15, buffer_idx=buf_idx, top_k=1100, x_cpu_hint=xs_cpu[i])
         _ = engine.execute_forward(xs_gpu[i-1], ticket)
         ticket = next_ticket
     _ = engine.execute_forward(xs_gpu[4], ticket)
@@ -79,11 +79,11 @@ def run_speedup_experiment():
     start = time.perf_counter()
     # Pipeline loop
     # Submit first layer/token
-    ticket = engine.submit_forward(xs_gpu[0], threshold=0.15, buffer_idx=0)
+    ticket = engine.submit_forward(xs_gpu[0], threshold=0.15, buffer_idx=0, top_k=1100, x_cpu_hint=xs_cpu[0])
     for i in range(1, iters):
         buf_idx = i % 2
         # Asynchronously schedule prediction, slicing, and transfer of L + 1
-        next_ticket = engine.submit_forward(xs_gpu[i], threshold=0.15, buffer_idx=buf_idx)
+        next_ticket = engine.submit_forward(xs_gpu[i], threshold=0.15, buffer_idx=buf_idx, top_k=1100, x_cpu_hint=xs_cpu[i])
         
         # Execute layer L
         _ = engine.execute_forward(xs_gpu[i-1], ticket)

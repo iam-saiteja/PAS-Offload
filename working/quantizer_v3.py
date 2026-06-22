@@ -4,16 +4,9 @@ def pack_2bit(tensor: torch.Tensor) -> tuple[torch.Tensor, float, float]:
     """
     Symmetrically quantizes a float16/float32 tensor to 2-bit integers [0, 3]
     and packs 4 weights per byte into a uint8 tensor.
-    
-    Returns:
-        packed_tensor (torch.Tensor): Packed uint8 weights.
-        scale (float): Scale factor for dequantization.
-        min_val (float): Minimum value offset.
     """
-    original_shape = tensor.shape
     numel = tensor.numel()
     
-    # Ensure element count is a multiple of 4 (padding if necessary)
     pad_len = (4 - (numel % 4)) % 4
     if pad_len > 0:
         flat = torch.cat([tensor.flatten(), torch.zeros(pad_len, dtype=tensor.dtype, device=tensor.device)])
@@ -25,11 +18,9 @@ def pack_2bit(tensor: torch.Tensor) -> tuple[torch.Tensor, float, float]:
     
     range_val = (max_val - min_val) if (max_val - min_val) > 1e-5 else 1.0
     
-    # Scale to [0, 3] and round
     quantized = torch.round((flat - min_val) / range_val * 3.0).to(torch.uint8)
     quantized = torch.clamp(quantized, 0, 3)
     
-    # Pack 4 weights (2-bits each) into a single uint8 byte
     w0 = quantized[0::4]
     w1 = quantized[1::4] << 2
     w2 = quantized[2::4] << 4
@@ -39,45 +30,29 @@ def pack_2bit(tensor: torch.Tensor) -> tuple[torch.Tensor, float, float]:
     
     return packed, range_val / 3.0, min_val
 
-def unpack_2bit(packed_tensor: torch.Tensor, scale: float, min_val: float, out_shape: tuple) -> torch.Tensor:
-    """
-    Unpacks a uint8 packed 2-bit tensor on the GPU and dequantizes back to float16.
-    """
-    w0 = packed_tensor & 0x03
-    w1 = (packed_tensor >> 2) & 0x03
-    w2 = (packed_tensor >> 4) & 0x03
-    w3 = (packed_tensor >> 6) & 0x03
-    
-    flat_packed = torch.stack([w0, w1, w2, w3], dim=1)
-    flat_unpacked = flat_packed.flatten()
-    
-    unpacked_f16 = flat_unpacked.to(torch.float16) * scale + min_val
-    
-    target_numel = 1
-    for dim in out_shape:
-        target_numel *= dim
-    unpacked_f16 = unpacked_f16[:target_numel]
-    
-    return unpacked_f16.reshape(out_shape)
 
-_GLOBAL_LUT = None
+# ----------------------------------------------------------------------------
+# LUT Initialization for V3 (Lookup Table Dequantization)
+# ----------------------------------------------------------------------------
+_LUT_2BIT_FLOAT16 = None
 
-def get_lut(device: torch.device) -> torch.Tensor:
-    global _GLOBAL_LUT
-    if _GLOBAL_LUT is None or _GLOBAL_LUT.device != device:
+def get_lut(device='cuda'):
+    global _LUT_2BIT_FLOAT16
+    if _LUT_2BIT_FLOAT16 is None or _LUT_2BIT_FLOAT16.device != torch.device(device):
         lut = torch.zeros((256, 4), dtype=torch.float16, device=device)
         for i in range(256):
             lut[i, 0] = i & 0x03
             lut[i, 1] = (i >> 2) & 0x03
             lut[i, 2] = (i >> 4) & 0x03
             lut[i, 3] = (i >> 6) & 0x03
-        _GLOBAL_LUT = lut
-    return _GLOBAL_LUT
+        _LUT_2BIT_FLOAT16 = lut
+    return _LUT_2BIT_FLOAT16
 
-def unpack_2bit_vectorized(packed_tensor: torch.Tensor, scales: torch.Tensor, min_vals: torch.Tensor, out_shape: tuple, out_tensor: torch.Tensor = None, temp_uint8_buffer: torch.Tensor = None) -> torch.Tensor:
+
+def unpack_2bit_lut_v3(packed_tensor: torch.Tensor, scales: torch.Tensor, min_vals: torch.Tensor, out_shape: tuple, out_tensor: torch.Tensor = None) -> torch.Tensor:
     """
-    Optimized 2-bit dequantization on GPU using a Lookup Table (LUT).
-    Avoids expensive bitwise shifting and memory accesses.
+    Ultra-fast 2-bit dequantization on GPU using a Lookup Table (LUT).
+    Reduces the number of GPU kernels from 8 (in V2) down to 3.
     """
     active_cols, bytes_per_col = packed_tensor.shape
     in_features = out_shape[1]

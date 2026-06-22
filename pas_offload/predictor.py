@@ -32,27 +32,16 @@ class LowRankPredictor(nn.Module):
         return torch.sigmoid(out)
 
     @torch.no_grad()
-    def predict_indices(self, x: torch.Tensor, threshold: float = 0.15) -> torch.Tensor:
-        """
-        Predicts the active column indices for a single input vector.
-        Expects x shape: (1, in_features) or (in_features,)
-        Returns a 1D CPU tensor containing the sorted indices of predicted active columns.
-        """
-        # Cast input to the predictor's parameter data type (typically float32) on CPU
-        # to prevent precision mismatches when LLM hidden states are float16/bfloat16
+    def predict_indices(self, x: torch.Tensor, threshold: float = 0.15, top_k: int = None) -> torch.Tensor:
         x_cpu = x.cpu().to(dtype=self.w1.weight.dtype)
-        
-        # Run forward pass
         probs = self.forward(x_cpu)
-        
-        # Squeeze to 1D
         probs_1d = probs[0]
         
-        # Get indices where prob > threshold
+        if top_k is not None:
+            _, indices = torch.topk(probs_1d, top_k)
+            return indices
+            
         indices = torch.nonzero(probs_1d > threshold, as_tuple=False).squeeze(-1)
-        
-        # Fallback: if no columns are predicted, select at least the top-1 column 
-        # to prevent downstream empty transfers
         if indices.numel() == 0:
             _, top_idx = torch.topk(probs_1d, 1)
             return top_idx

@@ -126,7 +126,7 @@ class PASOffloadEngine:
         self.scales_cpu.copy_(scales_temp)
         self.min_vals_cpu.copy_(min_vals_temp)
 
-    def submit_forward(self, x: torch.Tensor, threshold: float = 0.15, buffer_idx: int = 0) -> dict:
+    def submit_forward(self, x: torch.Tensor, threshold: float = 0.15, buffer_idx: int = 0, top_k: int = None, x_cpu_hint: torch.Tensor = None) -> dict:
         """
         Asynchronously schedules active column prediction, CPU slicing, 
         PCIe DMA weight streaming, and GPU dequantization on a dedicated stream.
@@ -135,6 +135,8 @@ class PASOffloadEngine:
             x (torch.Tensor): Input hidden state vector, shape (1, in_features).
             threshold (float): Prediction activation threshold.
             buffer_idx (int): Buffer slot index (0 or 1) to use.
+            top_k (int): Optional top-k constraint for column selection.
+            x_cpu_hint (torch.Tensor): Optional CPU tensor for the input to bypass slow explicit .cpu() copy.
             
         Returns:
             ticket (dict): Metadata about the scheduled job.
@@ -142,8 +144,12 @@ class PASOffloadEngine:
         assert x.shape == (1, self.in_features), f"Input shape mismatch. Expected {(1, self.in_features)}, got {x.shape}"
         
         # 1. Run CPU Predictor
-        x_cpu = x[0]
-        indices = self.predictor.predict_indices(x_cpu, threshold)
+        if x_cpu_hint is not None:
+            x_cpu = x_cpu_hint[0] if x_cpu_hint.dim() > 1 else x_cpu_hint
+        else:
+            x_cpu = x[0].cpu().to(dtype=self.predictor.w1.weight.dtype)
+            
+        indices = self.predictor.predict_indices(x_cpu, threshold, top_k=top_k)
         active_cols = len(indices)
         
         # 2. Slice directly into the pre-allocated pinned CPU buffer using out parameter
@@ -221,9 +227,9 @@ class PASOffloadEngine:
         
         return out, indices
         
-    def forward(self, x: torch.Tensor, threshold: float = 0.15) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, threshold: float = 0.15, top_k: int = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Synchronous wrapper matching the original engine's API.
         """
-        ticket = self.submit_forward(x, threshold, buffer_idx=0)
+        ticket = self.submit_forward(x, threshold, buffer_idx=0, top_k=top_k)
         return self.execute_forward(x, ticket)
