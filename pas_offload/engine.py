@@ -20,10 +20,16 @@ class PASOffloadEngine:
         # Calculate packed 2-bit bytes per column vector (4 weights per byte)
         self.bytes_per_col = in_features * 2 // 8
         
-        # Page-locked (pinned) CPU host buffers for fast asynchronous DMA transfers
-        self.packed_weights_cpu = torch.zeros(out_features, self.bytes_per_col, dtype=torch.uint8).pin_memory()
-        self.scales_cpu = torch.zeros(out_features, dtype=torch.float16).pin_memory()
-        self.min_vals_cpu = torch.zeros(out_features, dtype=torch.float16).pin_memory()
+        # Page-locked (pinned) CPU host buffers for fast asynchronous DMA transfers.
+        # Conditionally pinned only if a CUDA device is available.
+        if torch.cuda.is_available():
+            self.packed_weights_cpu = torch.zeros(out_features, self.bytes_per_col, dtype=torch.uint8).pin_memory()
+            self.scales_cpu = torch.zeros(out_features, dtype=torch.float16).pin_memory()
+            self.min_vals_cpu = torch.zeros(out_features, dtype=torch.float16).pin_memory()
+        else:
+            self.packed_weights_cpu = torch.zeros(out_features, self.bytes_per_col, dtype=torch.uint8)
+            self.scales_cpu = torch.zeros(out_features, dtype=torch.float16)
+            self.min_vals_cpu = torch.zeros(out_features, dtype=torch.float16)
         
     def load_weights(self, weights_f16: torch.Tensor):
         """
@@ -47,7 +53,7 @@ class PASOffloadEngine:
             scales_temp[i] = scale
             min_vals_temp[i] = min_val
             
-        # Copy into pinned host memory
+        # Copy into host memory
         self.packed_weights_cpu.copy_(packed_temp)
         self.scales_cpu.copy_(scales_temp)
         self.min_vals_cpu.copy_(min_vals_temp)

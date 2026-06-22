@@ -3,6 +3,5 @@ __pycache__/
 .venv/
 .uv/
 *.bin
-*.png
 .idea/
 .vscode/
