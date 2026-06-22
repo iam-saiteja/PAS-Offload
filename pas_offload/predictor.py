@@ -38,8 +38,12 @@ class LowRankPredictor(nn.Module):
         Expects x shape: (1, in_features) or (in_features,)
         Returns a 1D CPU tensor containing the sorted indices of predicted active columns.
         """
-        # Run forward pass (always forced on CPU for low latency and zero host sync overhead)
-        probs = self.forward(x.cpu())
+        # Cast input to the predictor's parameter data type (typically float32) on CPU
+        # to prevent precision mismatches when LLM hidden states are float16/bfloat16
+        x_cpu = x.cpu().to(dtype=self.w1.weight.dtype)
+        
+        # Run forward pass
+        probs = self.forward(x_cpu)
         
         # Squeeze to 1D
         probs_1d = probs[0]
